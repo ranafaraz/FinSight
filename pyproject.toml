@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finsight"
+version = "0.1.0"
+description = "Offline-first news-sentiment alpha with overfitting-aware backtesting (Deflated Sharpe Ratio, purged walk-forward CV, transaction costs, event studies)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Rana Faraz" }]
+keywords = ["quant", "finance", "backtesting", "nlp", "sentiment", "deflated-sharpe", "alpha"]
+classifiers = [
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Intended Audience :: Financial and Insurance Industry",
+  "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+  "numpy>=1.23",
+  "pandas>=1.5",
+  "scipy>=1.9",
+]
+
+[project.optional-dependencies]
+# Optional real-model backend: FinBERT sentiment via transformers.
+finbert = ["transformers>=4.30", "torch>=2.0"]
+# Optional real market data.
+market = ["yfinance>=0.2"]
+dev = [
+  "pytest>=7.0",
+  "ruff>=0.1",
+]
+
+[project.scripts]
+finsight = "finsight.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ranafaraz/FinSight"
+Repository = "https://github.com/ranafaraz/FinSight"
+
+[tool.setuptools.packages.find]
+include = ["finsight*", "evals*"]
+
+[tool.setuptools.package-data]
+"evals" = ["data/*.csv", "data/*.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["E741"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
