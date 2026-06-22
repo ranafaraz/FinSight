@@ -1,0 +1,193 @@
+"""Offline eval harness: validates the full pipeline against synthetic ground truth.
+
+Run: ``python -m evals.harness`` (writes ``evals/RESULTS.md``).
+
+It deliberately *searches* a small grid of signal-smoothing windows and reports
+the winner's Deflated Sharpe -- the honest way to present a backtest that came
+out of a search. A scrambled-signal NULL run is included so the reader can see
+the deflation machinery reject a false positive.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from evals.metrics import sentiment_recovery, shuffled_sentiment
+from finsight.backtest.engine import run_backtest
+from finsight.config import Settings
+from finsight.data.factory import load_panel
+from finsight.eventstudy.study import event_study
+from finsight.sentiment.factory import get_backend
+from finsight.signals.factor import build_signal, score_news
+from finsight.stats.cpcv import PurgedWalkForwardCV
+from finsight.stats.deflated_sharpe import (
+    deflated_sharpe_ratio,
+    min_track_record_length,
+    probabilistic_sharpe_ratio,
+)
+from finsight.stats.metrics import information_coefficient, sharpe_ratio, summarize
+
+SMOOTHING_GRID = [1, 2, 3, 5, 8, 13, 21]
+RESULTS_PATH = Path(__file__).parent / "RESULTS.md"
+
+
+def _period_sharpe(r: pd.Series) -> float:
+    sd = r.std(ddof=1)
+    return 0.0 if sd == 0 or len(r) < 2 else float(r.mean() / sd)
+
+
+def _trial(panel, sentiment: pd.DataFrame, w: int, cfg: Settings):
+    smoothed = sentiment.rolling(w, min_periods=1).mean()
+    signal = build_signal(smoothed, winsorize=cfg.winsorize)
+    bt = run_backtest(signal, panel.returns, cost_per_turn=cfg.cost_per_turn)
+    return bt.returns, signal
+
+
+def _search(panel, sentiment: pd.DataFrame, cfg: Settings):
+    """Run the smoothing-window search; return (best_returns, best_signal, sr_variance)."""
+    results = [(w, *_trial(panel, sentiment, w, cfg)) for w in SMOOTHING_GRID]
+    period_sharpes = [_period_sharpe(r) for _, r, _ in results]
+    sr_variance = float(np.var(period_sharpes, ddof=1))
+    best_i = int(np.argmax(period_sharpes))
+    best_w, best_r, best_sig = results[best_i]
+    return best_w, best_r, best_sig, sr_variance
+
+
+def run_eval(settings: Settings | None = None) -> dict:
+    cfg = settings or Settings.from_env()
+    panel = load_panel(cfg)
+    backend = get_backend(cfg)
+
+    sentiment = score_news(panel, backend)
+    recovery = sentiment_recovery(panel, backend)
+
+    n_trials = len(SMOOTHING_GRID)
+    best_w, best_r, best_sig, sr_var = _search(panel, sentiment, cfg)
+
+    summary = summarize(best_r)
+    ic = information_coefficient(best_sig.scores, panel.returns)
+    psr = probabilistic_sharpe_ratio(best_r, sr_benchmark=0.0)
+    dsr = deflated_sharpe_ratio(best_r, sr_var, n_trials)
+    mtrl = min_track_record_length(best_r)
+
+    # Purged, embargoed walk-forward out-of-sample Sharpe.
+    cv = PurgedWalkForwardCV(n_splits=5, horizon=1, embargo=5, min_train=120)
+    oos = [sharpe_ratio(best_r.iloc[te]) for _, te in cv.split(len(best_r))]
+    oos_sharpe = float(np.mean(oos)) if oos else 0.0
+
+    # Event study (independent confirmation the news carries information).
+    events = [(n.date, n.asset, n.true_sentiment or 0.0) for n in panel.news]
+    es = event_study(panel, events, threshold=0.4)
+
+    # NULL test: scramble the signal, repeat the same search, expect collapse.
+    shuf = shuffled_sentiment(sentiment, seed=cfg.seed + 1)
+    _, null_r, _, null_sr_var = _search(panel, shuf, cfg)
+    null_sharpe = sharpe_ratio(null_r)
+    null_dsr = deflated_sharpe_ratio(null_r, null_sr_var, n_trials)
+
+    return {
+        "config": {
+            "sentiment_backend": backend.name,
+            "data_backend": cfg.data_backend,
+            "n_assets": cfg.n_assets,
+            "n_days": cfg.n_days,
+            "n_news": len(panel.news),
+            "search_grid": SMOOTHING_GRID,
+            "best_smoothing": best_w,
+            "cost_per_turn": cfg.cost_per_turn,
+        },
+        "sentiment_recovery_corr": round(recovery, 3),
+        "information_coefficient": round(ic, 3),
+        "ann_return": round(summary["ann_return"], 4),
+        "ann_vol": round(summary["ann_vol"], 4),
+        "sharpe": round(summary["sharpe"], 3),
+        "sortino": round(summary["sortino"], 3),
+        "max_drawdown": round(summary["max_drawdown"], 4),
+        "psr": round(psr, 3),
+        "deflated_sharpe": round(dsr, 3),
+        "min_track_record_len": round(mtrl, 1),
+        "walk_forward_oos_sharpe": round(oos_sharpe, 3),
+        "event_car_long_short": round(es.car_long_short_final, 4),
+        "event_t_stat": round(es.t_long_short, 2),
+        "event_n": es.n_pos + es.n_neg,
+        "null_sharpe": round(null_sharpe, 3),
+        "null_deflated_sharpe": round(null_dsr, 3),
+    }
+
+
+def _render_markdown(res: dict) -> str:
+    c = res["config"]
+    lines = [
+        "# FinSight - Offline Evaluation Results",
+        "",
+        "Generated by `python -m evals.harness` on the deterministic synthetic "
+        "market (no API keys, no model downloads). The market embeds a *known* "
+        "sentiment -> next-day-return signal, so these numbers have ground truth.",
+        "",
+        f"**Config**: {c['sentiment_backend']} sentiment, {c['data_backend']} data, "
+        f"{c['n_assets']} assets x {c['n_days']} days, {c['n_news']} headlines, "
+        f"{c['cost_per_turn']*1e4:.0f} bps cost/turn. "
+        f"Smoothing search grid {c['search_grid']} -> selected window {c['best_smoothing']}.",
+        "",
+        "## Headline strategy (selected configuration)",
+        "",
+        "| Metric | Value | Reads as |",
+        "|---|---:|---|",
+        f"| Sentiment recovery corr | {res['sentiment_recovery_corr']:.3f} | "
+        "lexical model vs. latent truth |",
+        f"| Information coefficient (rank IC) | {res['information_coefficient']:.3f} | "
+        "signal vs. next-day return |",
+        f"| Annualised return | {res['ann_return']:.2%} | net of costs |",
+        f"| Annualised volatility | {res['ann_vol']:.2%} | |",
+        f"| **Sharpe (annualised)** | **{res['sharpe']:.2f}** | in-sample, selected config |",
+        f"| Sortino | {res['sortino']:.2f} | |",
+        f"| Max drawdown | {res['max_drawdown']:.2%} | |",
+        f"| Walk-forward OOS Sharpe | {res['walk_forward_oos_sharpe']:.2f} | "
+        "purged + embargoed |",
+        "",
+        "## Overfitting-aware diagnostics",
+        "",
+        "| Metric | Value | Reads as |",
+        "|---|---:|---|",
+        f"| Probabilistic Sharpe (PSR) | {res['psr']:.3f} | P(true Sharpe > 0) |",
+        f"| **Deflated Sharpe (DSR)** | **{res['deflated_sharpe']:.3f}** | "
+        f"PSR vs. expected max of {len(c['search_grid'])} trials |",
+        f"| Min track-record length | {res['min_track_record_len']:.0f} days | "
+        "to confirm at 95% |",
+        "",
+        "## Event study (independent confirmation)",
+        "",
+        f"Across {res['event_n']} high-conviction news events, the positive-minus-"
+        f"negative cumulative abnormal return at +5 days is "
+        f"**{res['event_car_long_short']:+.4f}** with t = **{res['event_t_stat']:.2f}**.",
+        "",
+        "## NULL test (signal scrambled across assets)",
+        "",
+        "| Metric | Real signal | Scrambled (null) |",
+        "|---|---:|---:|",
+        f"| Sharpe (annualised) | {res['sharpe']:.2f} | {res['null_sharpe']:.2f} |",
+        f"| Deflated Sharpe | {res['deflated_sharpe']:.3f} | {res['null_deflated_sharpe']:.3f} |",
+        "",
+        "The Deflated Sharpe collapses on the scrambled signal: the same search that "
+        "produced a 'winner' is correctly recognised as luck once the real alpha is "
+        "removed. That gap is the whole point.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def main() -> int:
+    res = run_eval()
+    RESULTS_PATH.write_text(_render_markdown(res), encoding="utf-8")
+    # ASCII-only console output (Windows console is cp1252).
+    print("FinSight eval complete. Wrote", RESULTS_PATH.name)
+    print(json.dumps(res, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
